@@ -46,6 +46,7 @@ from sqlalchemy import select
 from sqlalchemy import String
 from sqlalchemy import text
 from sqlalchemy import update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -228,6 +229,16 @@ class IdempotencyRecord(TransactionBase):
   response_status = Column(Integer)
   response_body = Column(JSON)
   created_at = Column(String)
+
+
+class AttemptCounter(TransactionBase):
+  """Failed Complete Checkout attempts for one checkout (attempt budget)."""
+
+  __tablename__ = "attempt_counters"
+
+  checkout_id = Column(String, primary_key=True)
+  used = Column(Integer, nullable=False, default=0)
+  max_failed = Column(Integer, nullable=False)
 
 
 class PaymentInstrument(TransactionBase):
@@ -601,6 +612,62 @@ async def save_idempotency_record(
     created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
   )
   session.add(record)
+
+
+async def ensure_attempt_counter(
+  session: AsyncSession, checkout_id: str, max_failed: int
+) -> None:
+  """Create the counter row for a checkout if it does not exist yet."""
+  stmt = (
+    sqlite_insert(AttemptCounter)
+    .values(checkout_id=checkout_id, used=0, max_failed=max_failed)
+    .on_conflict_do_nothing(index_elements=["checkout_id"])
+  )
+  await session.execute(stmt)
+  await session.commit()
+
+
+async def get_attempt_counter(
+  session: AsyncSession, checkout_id: str
+) -> tuple[int, int] | None:
+  """Return (used, max_failed) for a checkout, or None if never counted."""
+  row = (
+    await session.execute(
+      select(AttemptCounter.used, AttemptCounter.max_failed).where(
+        AttemptCounter.checkout_id == checkout_id
+      )
+    )
+  ).first()
+  return (row[0], row[1]) if row else None
+
+
+async def reserve_attempt(session: AsyncSession, checkout_id: str) -> bool:
+  """Atomically count one attempt; False when the budget is spent.
+
+  A single conditional UPDATE: concurrent callers cannot all pass a
+  check-then-increment window, so at most `max_failed` attempts are ever
+  forwarded to payment processing. An attempt in flight is already counted,
+  so the limit also bounds concurrency.
+  """
+  stmt = (
+    update(AttemptCounter)
+    .where(AttemptCounter.checkout_id == checkout_id)
+    .where(AttemptCounter.used < AttemptCounter.max_failed)
+    .values(used=AttemptCounter.used + 1)
+  )
+  result = await session.execute(stmt)
+  await session.commit()
+  return result.rowcount > 0
+
+
+async def release_attempt(session: AsyncSession, checkout_id: str) -> None:
+  """Un-count an attempt that did not end in a payment decline."""
+  await session.execute(
+    update(AttemptCounter)
+    .where(AttemptCounter.checkout_id == checkout_id)
+    .values(used=AttemptCounter.used - 1)
+  )
+  await session.commit()
 
 
 async def commit_with_idempotency(

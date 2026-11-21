@@ -68,6 +68,11 @@ def get_server_version() -> str:
   return profile["ucp"]["version"]
 
 
+def get_profile_capability(name: str) -> list[dict]:
+  """Return a capability's profile entries (empty if not advertised)."""
+  return list(_get_profile()["ucp"].get("capabilities", {}).get(name, []))
+
+
 def get_payment_handlers() -> dict:
   """Read and cache the payment handlers from the discovery profile."""
   profile = _get_profile()

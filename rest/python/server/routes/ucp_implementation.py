@@ -173,8 +173,10 @@ async def create_checkout(
   if webhook_url:
     platform_config = PlatformSchema(webhook_url=webhook_url)
 
-  return await checkout_service.create_checkout(
-    unified_req, idempotency_key, platform_config
+  return await checkout_service.with_attempts(
+    await checkout_service.create_checkout(
+      unified_req, idempotency_key, platform_config
+    )
   )
 
 
@@ -189,7 +191,9 @@ async def get_checkout(
 ) -> models.UnifiedCheckout:
   """Get Checkout Implementation."""
   del common_headers  # Unused
-  return await checkout_service.get_checkout(checkout_id)
+  return await checkout_service.with_attempts(
+    await checkout_service.get_checkout(checkout_id)
+  )
 
 
 async def update_checkout(
@@ -212,8 +216,10 @@ async def update_checkout(
   if webhook_url:
     platform_config = PlatformSchema(webhook_url=webhook_url)
 
-  return await checkout_service.update_checkout(
-    checkout_id, unified_req, idempotency_key, platform_config
+  return await checkout_service.with_attempts(
+    await checkout_service.update_checkout(
+      checkout_id, unified_req, idempotency_key, platform_config
+    )
   )
 
 
@@ -241,11 +247,13 @@ async def complete_checkout(
     **checkout_complete.payment.model_dump(mode="json", exclude_none=True)
   )
 
-  return await checkout_service.complete_checkout(
-    checkout_id,
-    payment_req,
-    idempotency_key,
-    checkout_complete=checkout_complete,
+  return await checkout_service.with_attempts(
+    await checkout_service.complete_checkout(
+      checkout_id,
+      payment_req,
+      idempotency_key,
+      checkout_complete=checkout_complete,
+    )
   )
 
 
@@ -260,7 +268,9 @@ async def cancel_checkout(
   ],
 ) -> models.UnifiedCheckout:
   """Cancel Checkout Implementation."""
-  return await checkout_service.cancel_checkout(checkout_id, idempotency_key)
+  return await checkout_service.with_attempts(
+    await checkout_service.cancel_checkout(checkout_id, idempotency_key)
+  )
 
 
 async def create_cart(

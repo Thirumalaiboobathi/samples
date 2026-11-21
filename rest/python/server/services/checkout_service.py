@@ -38,6 +38,7 @@ import logging
 from typing import Any
 import uuid
 
+import attempt_budget
 import config
 import db
 from enums import CheckoutStatus
@@ -786,6 +787,11 @@ class CheckoutService:
         raise IdempotencyConflictError(
           "Idempotency key reused with different parameters"
         )
+      failure = existing_record.response_body.get("__payment_failed")
+      if failure:
+        # A counted decline: replay the original answer, never the rail, and
+        # never count it again (attempt budget rule 4).
+        raise PaymentFailedError(**failure)
       return Checkout(**existing_record.response_body)
 
     # Log the request
@@ -805,6 +811,18 @@ class CheckoutService:
       raise InvalidRequestError(
         "Fulfillment address and option must be selected before completion."
       )
+
+    # Attempt budget: claim one attempt slot before anything can reach the
+    # payment rail. Refusal returns the checkout; the route escalates it.
+    budget_slot = False
+    if attempt_budget.enabled():
+      await attempt_budget.counter(self.transactions_session, checkout_id)
+      budget_slot = await db.reserve_attempt(
+        self.transactions_session, checkout_id
+      )
+      if not budget_slot:
+        logger.info("Attempt budget spent for checkout %s", checkout_id)
+        return checkout
 
     # Atomic Inventory Reservation + Order Completion
     try:
@@ -980,6 +998,8 @@ class CheckoutService:
         response_body,
       )
       if cached is not None:
+        if budget_slot:
+          await db.release_attempt(self.transactions_session, checkout_id)
         return Checkout(**cached)
 
       # Notify webhook of order placement
@@ -987,9 +1007,58 @@ class CheckoutService:
 
     except Exception as e:
       await self.transactions_session.rollback()
+      if budget_slot:
+        await self._settle_budget_slot(
+          checkout_id, idempotency_key, request_hash, e
+        )
       raise e
 
+    if budget_slot:
+      await db.release_attempt(self.transactions_session, checkout_id)
     return checkout
+
+  async def _settle_budget_slot(
+    self,
+    checkout_id: str,
+    idempotency_key: str,
+    request_hash: str,
+    error: Exception,
+  ) -> None:
+    """Keep the count for a payment decline (and record it); else release."""
+    if not isinstance(error, PaymentFailedError):
+      await db.release_attempt(self.transactions_session, checkout_id)
+      return
+    try:
+      # Record the decline so a replay of this request is answered from the
+      # record and is not counted again.
+      await db.commit_with_idempotency(
+        self.transactions_session,
+        idempotency_key,
+        request_hash,
+        error.status_code,
+        {
+          "__payment_failed": {
+            "message": error.message,
+            "code": error.code,
+            "status_code": error.status_code,
+          }
+        },
+      )
+    except IdempotencyConflictError:
+      await self.transactions_session.rollback()
+
+  async def with_attempts(self, checkout: Checkout) -> Checkout:
+    """Add `attempts` to a checkout response; escalate it when exhausted."""
+    if not attempt_budget.enabled():
+      return checkout
+    attempts = await attempt_budget.counter(
+      self.transactions_session, checkout.id
+    )
+    body = checkout.model_dump(mode="json", by_alias=True, exclude_none=True)
+    body = attempt_budget.decorate(
+      body, attempts, f"{self.base_url}/checkout/{checkout.id}/resume"
+    )
+    return Checkout(**body)
 
   async def _notify_webhook(self, checkout: Checkout, event_type: str) -> None:
     """Notifies the configured webhook of an order event.
